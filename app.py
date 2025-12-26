@@ -23,8 +23,6 @@ def check_password():
     On Streamlit Cloud, set:
       APP_PASSWORD = "your-password-here"
     in the app's Secrets.
-
-    If you want a different key name, change "APP_PASSWORD" below.
     """
     secret_key = "APP_PASSWORD"
 
@@ -66,12 +64,30 @@ st.write(
 )
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants / Canonical Labels
 # ---------------------------------------------------------------------------
 
 REVENUE_CODES = {"1", "2", "3", "4", "6", "7", "9"}
 EXPENSE_CODES = {"14", "15", "16", "18", "19", "22", "23"}
 ALL_CODES = REVENUE_CODES | EXPENSE_CODES
+
+# Canonical IRS labels (used if a code is missing from uploaded data but needed for rollup/adjustments)
+CATEGORY_LABELS = {
+    "1": "Gifts, grants, contributions received",
+    "2": "Membership fees received",
+    "3": "Gross sales of inventory",
+    "4": "Other revenue",
+    "6": "Investment income",
+    "7": "Other income",
+    "9": "Gross receipts from activities related to exempt purpose",
+    "14": "Professional fees and other payments to independent contractors",
+    "15": "Occupancy, rent, utilities, and maintenance",
+    "16": "Disbursements to/for members",
+    "18": "Office expenses",
+    "19": "Travel",
+    "22": "Payments to affiliates",
+    "23": "Other expenses",
+}
 
 HARD_REQUIRED_COLUMNS = {
     "Year",
@@ -186,9 +202,7 @@ def validate_categories(df: pd.DataFrame):
     codes = set(df["IRS Category Code"].unique())
     unknown = codes - ALL_CODES
     if unknown:
-        st.error(
-            "Unexpected IRS Category Codes found: " + ", ".join(sorted(unknown))
-        )
+        st.error("Unexpected IRS Category Codes found: " + ", ".join(sorted(unknown)))
         st.stop()
 
 
@@ -204,6 +218,66 @@ def build_summary_table(df: pd.DataFrame) -> pd.DataFrame:
     summary["__code_int"] = pd.to_numeric(summary["IRS Category Code"], errors="coerce")
     summary = summary.sort_values("__code_int").drop(columns="__code_int")
     return summary
+
+
+def ensure_category_rows_exist(summary_df: pd.DataFrame, codes_needed: set) -> pd.DataFrame:
+    """
+    Ensure rows exist in the summary for specific codes.
+    If missing, create rows with Raw Total = 0 and Adjusted Total = 0, using canonical labels.
+    """
+    existing = set(summary_df["IRS Category Code"].astype(str).unique())
+    missing = {c for c in codes_needed if c not in existing}
+    if not missing:
+        return summary_df
+
+    new_rows = []
+    for code in sorted(missing, key=lambda x: int(x)):
+        new_rows.append({
+            "IRS Category Code": code,
+            "IRS Category Label": CATEGORY_LABELS.get(code, ""),
+            "Raw Total Amount": 0.0,
+            "Adjusted Total Amount": 0.0,
+        })
+
+    combined = pd.concat([summary_df, pd.DataFrame(new_rows)], ignore_index=True)
+    combined["__code_int"] = pd.to_numeric(combined["IRS Category Code"], errors="coerce")
+    combined = combined.sort_values("__code_int").drop(columns="__code_int").reset_index(drop=True)
+    return combined
+
+
+def apply_gala_ticket_reclass(summary_df: pd.DataFrame, gala_amount: float) -> pd.DataFrame:
+    """
+    Subtract gala_amount from Adjusted Total for category 2,
+    add gala_amount to Adjusted Total for category 9.
+    Raw totals remain unchanged.
+    """
+    # Ensure rows exist for 2 and 9 even if not present in uploaded data
+    summary_df = ensure_category_rows_exist(summary_df, {"2", "9"})
+
+    gala_amount = float(gala_amount or 0.0)
+    if gala_amount < 0:
+        st.error("Gala ticket amount cannot be negative.")
+        st.stop()
+
+    # Find category 2 row
+    idx2 = summary_df.index[summary_df["IRS Category Code"] == "2"].tolist()
+    idx9 = summary_df.index[summary_df["IRS Category Code"] == "9"].tolist()
+
+    raw2 = float(summary_df.loc[idx2[0], "Raw Total Amount"]) if idx2 else 0.0
+
+    # Guardrail: don't allow subtracting more than the entire raw category 2
+    if gala_amount > raw2 + 1e-9:
+        st.error(
+            f"Gala ticket amount ({format_currency(gala_amount)}) cannot exceed the raw total for "
+            f"Category 2 ({format_currency(raw2)}). Please enter a smaller amount."
+        )
+        st.stop()
+
+    # Apply adjustment
+    summary_df.loc[idx2[0], "Adjusted Total Amount"] = float(summary_df.loc[idx2[0], "Adjusted Total Amount"]) - gala_amount
+    summary_df.loc[idx9[0], "Adjusted Total Amount"] = float(summary_df.loc[idx9[0], "Adjusted Total Amount"]) + gala_amount
+
+    return summary_df
 
 
 def show_month_coverage(df: pd.DataFrame):
@@ -239,7 +313,7 @@ def get_sorted_category_rows(summary_df: pd.DataFrame, desired_codes: set) -> pd
     return filtered
 
 
-def build_annual_report(year: int, summary_df: pd.DataFrame, full_df: pd.DataFrame) -> str:
+def build_annual_report(year: int, summary_df: pd.DataFrame, full_df: pd.DataFrame, gala_ticket_amount: float) -> str:
     """Build the complete annual text report."""
     lines = []
 
@@ -289,7 +363,10 @@ def build_annual_report(year: int, summary_df: pd.DataFrame, full_df: pd.DataFra
 
     rev_df = full_df[full_df["IRS Category Code"].isin(REVENUE_CODES)].copy()
 
-    if rev_df.empty:
+    # We'll always include Category 9 section if gala_ticket_amount is provided (even if there are no Cat 9 txns)
+    gala_ticket_amount = float(gala_ticket_amount or 0.0)
+
+    if rev_df.empty and gala_ticket_amount == 0.0:
         lines.append("  (No itemized revenue entries.)")
     else:
         # Category 1 – Sponsors
@@ -312,22 +389,36 @@ def build_annual_report(year: int, summary_df: pd.DataFrame, full_df: pd.DataFra
 
         # Other revenue categories
         for code in sorted(REVENUE_CODES - {"1"}, key=lambda x: int(x)):
-            cat_df = rev_df[rev_df["IRS Category Code"] == code]
-            if cat_df.empty:
+            cat_df = rev_df[rev_df["IRS Category Code"] == code].copy()
+
+            # Force a Category 9 section even if there are no underlying Cat 9 transactions,
+            # so we can show the Gala Tickets line.
+            if cat_df.empty and code != "9":
                 continue
 
-            label = cat_df["IRS Category Label"].iloc[0]
-            lines.append(f"  Category {code} – {label}:")
-            cat_df["Itemization Label"] = clean_str_series(cat_df["Itemization Label"]).replace("", "UNLABELED")
+            label = None
+            if not cat_df.empty:
+                label = cat_df["IRS Category Label"].iloc[0]
+            else:
+                label = CATEGORY_LABELS.get(code, "")
 
-            group = (
-                cat_df.groupby("Itemization Label")["Amount"]
-                .sum()
-                .reset_index()
-                .sort_values("Itemization Label")
-            )
-            for _, r in group.iterrows():
-                lines.append(f"    {r['Itemization Label']}: {format_currency(r['Amount'])}")
+            lines.append(f"  Category {code} – {label}:")
+
+            # Insert Gala Tickets line for Category 9
+            if code == "9":
+                lines.append(f"    Gala Tickets: {format_currency(gala_ticket_amount)}")
+
+            # For underlying transaction-based itemization (if any)
+            if not cat_df.empty:
+                cat_df["Itemization Label"] = clean_str_series(cat_df["Itemization Label"]).replace("", "UNLABELED")
+                group = (
+                    cat_df.groupby("Itemization Label")["Amount"]
+                    .sum()
+                    .reset_index()
+                    .sort_values("Itemization Label")
+                )
+                for _, r in group.iterrows():
+                    lines.append(f"    {r['Itemization Label']}: {format_currency(r['Amount'])}")
 
     # ITEMIZED EXPENSES
     lines.append("")
@@ -342,7 +433,10 @@ def build_annual_report(year: int, summary_df: pd.DataFrame, full_df: pd.DataFra
     else:
         # Category 16 – Events
         cat16 = exp_df[exp_df["IRS Category Code"] == "16"].copy()
+        any_detail = False
+
         if not cat16.empty:
+            any_detail = True
             lines.append(f"  Category 16 – {cat16['IRS Category Label'].iloc[0]} (individual events):")
             lines.append("    Date | Event | Location | Purpose | Amount")
             cat16 = cat16.sort_values(["Date", "Member/Event Label"])
@@ -356,13 +450,14 @@ def build_annual_report(year: int, summary_df: pd.DataFrame, full_df: pd.DataFra
 
         # Other expense categories
         for code in sorted(EXPENSE_CODES - {"16"}, key=lambda x: int(x)):
-            cat_df = exp_df[exp_df["IRS Category Code"] == code]
+            cat_df = exp_df[exp_df["IRS Category Code"] == code].copy()
             if cat_df.empty:
                 continue
 
             if not cat_df["Itemization Label"].str.strip().ne("").any():
                 continue
 
+            any_detail = True
             label = cat_df["IRS Category Label"].iloc[0]
             lines.append(f"  Category {code} – {label} (consolidated by type):")
             cat_df["Itemization Label"] = clean_str_series(cat_df["Itemization Label"]).replace("", "UNLABELED")
@@ -375,6 +470,9 @@ def build_annual_report(year: int, summary_df: pd.DataFrame, full_df: pd.DataFra
             )
             for _, r in group.iterrows():
                 lines.append(f"    {r['Itemization Label']}: {format_currency(r['Amount'])}")
+
+        if not any_detail:
+            lines.append("  (No itemized expense entries.)")
 
     # NEEDS FURTHER INVESTIGATION
     lines.append("")
@@ -437,16 +535,55 @@ st.subheader(f"Annual Report – {year}")
 show_month_coverage(full_df)
 
 # ---------------------------------------------------------------------------
-# STEP 2 — Annual Summary
+# NEW STEP — Gala Ticket Reclassification (2 -> 9)
+# ---------------------------------------------------------------------------
+
+st.header("Step 1B – Gala Ticket Reclassification (Category 2 → Category 9)")
+
+# Compute raw total for category 2 for guardrail messaging
+cat2_raw_total = float(full_df.loc[full_df["IRS Category Code"] == "2", "Amount"].sum())
+
+st.write(
+    'How much **uncategorized revenue** came in from **Gala Ticket Sales** that is currently embedded within '
+    '**Category "2 - Membership fees received"**? Enter a dollar amount (may be zero). '
+    'This amount will be **subtracted from Category 2** and **added to Category 9**.'
+)
+
+gala_ticket_amount = st.number_input(
+    "Gala ticket amount to reclassify (USD)",
+    min_value=0.0,
+    value=float(st.session_state.get("gala_ticket_amount", 0.0)),
+    step=10.0,
+    format="%.2f",
+    help=f"Raw total currently in Category 2 is {format_currency(cat2_raw_total)}.",
+)
+
+# Persist in session_state
+st.session_state["gala_ticket_amount"] = float(gala_ticket_amount)
+
+# Quick feedback line
+st.caption(
+    f"Category 2 raw total: {format_currency(cat2_raw_total)} • "
+    f"Reclass amount: {format_currency(gala_ticket_amount)} • "
+    f"Net Category 2 after reclass (for Adjusted totals only): {format_currency(cat2_raw_total - gala_ticket_amount)}"
+)
+
+# ---------------------------------------------------------------------------
+# STEP 2 — Annual Summary (with Gala adjustment applied to Adjusted totals)
 # ---------------------------------------------------------------------------
 
 st.header("Step 2 – Annual Summary by IRS Category")
 
 summary_df = build_summary_table(full_df)
 
+# Apply gala reclass before showing editor
+summary_df = apply_gala_ticket_reclass(summary_df, gala_ticket_amount)
+
 st.write(
     "Review the annual totals below. You may edit the **Adjusted Total Amount** "
-    "column to apply year-end corrections. Raw totals come directly from uploaded data."
+    "column to apply year-end corrections. Raw totals come directly from uploaded data.\n\n"
+    "Note: The Gala Ticket reclassification above has already been applied to the **Adjusted** totals for "
+    "Category 2 and Category 9."
 )
 
 edited_summary_df = st.data_editor(
@@ -467,7 +604,10 @@ if "annual_report_text" not in st.session_state:
 
 if st.button("Generate Annual Text Report"):
     st.session_state["annual_report_text"] = build_annual_report(
-        year, edited_summary_df, full_df
+        year,
+        edited_summary_df,
+        full_df,
+        gala_ticket_amount=float(st.session_state.get("gala_ticket_amount", 0.0)),
     )
 
 if st.session_state["annual_report_text"]:
