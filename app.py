@@ -280,7 +280,7 @@ def label_for_itemization_990(df: pd.DataFrame) -> pd.Series:
 # ---------------------------------------------------------------------------
 
 
-def build_report_1023(year: int, df: pd.DataFrame) -> str:
+def build_report_1023(year: int, df: pd.DataFrame, gala_adjustment: float = 0.0) -> str:
     lines: List[str] = []
 
     lines.append(f"{year} Foreign Area Officer Association Annual Financial Report (1023 / 990-EZ Style)")
@@ -288,13 +288,24 @@ def build_report_1023(year: int, df: pd.DataFrame) -> str:
     lines.append("=" * 70)
     lines.append("")
 
+    # Note gala adjustment if applicable
+    if gala_adjustment > 0:
+        lines.append("NOTE: Gala Revenue Adjustment Applied")
+        lines.append("-" * 40)
+        lines.append(f"  ${gala_adjustment:,.2f} reallocated from Category 2 (Membership fees)")
+        lines.append(f"  to Category 6 (Fundraising events) to correct Stripe commingling.")
+        lines.append("")
+
     # Summary totals by 1023 category
     df = df.copy()
     df["__code"] = df["IRS Category Code (1023)"].astype(str)
 
-    # Calculate grand totals
-    total_revenue = df[df["__code"].isin(REVENUE_CODES_1023)]["Amount"].sum()
+    # Calculate raw totals
+    raw_revenue = df[df["__code"].isin(REVENUE_CODES_1023)]["Amount"].sum()
     total_expenses = df[df["__code"].isin(EXPENSE_CODES_1023)]["Amount"].abs().sum()
+    
+    # Gala adjustment doesn't change total revenue, just reallocation
+    total_revenue = raw_revenue
     net_change = total_revenue - total_expenses
 
     lines.append("SUMMARY")
@@ -304,7 +315,7 @@ def build_report_1023(year: int, df: pd.DataFrame) -> str:
     lines.append(f"  Net Change:     {format_currency(net_change)}")
     lines.append("")
 
-    # Revenue summary
+    # Revenue summary with gala adjustment
     lines.append("REVENUE CATEGORIES (by IRS Category Code 1023)")
     lines.append("-" * 40)
     rev = df[df["__code"].isin(REVENUE_CODES_1023)]
@@ -318,9 +329,36 @@ def build_report_1023(year: int, df: pd.DataFrame) -> str:
         )
         rev_summary["__sort"] = pd.to_numeric(rev_summary["IRS Category Code (1023)"], errors="coerce")
         rev_summary = rev_summary.sort_values("__sort").drop(columns="__sort")
+        
+        # Track if we need to add Category 6
+        has_cat_6 = "6" in rev_summary["IRS Category Code (1023)"].values
+        
         for _, r in rev_summary.iterrows():
+            code = r["IRS Category Code (1023)"]
+            amount = r["Amount"]
+            label = r["IRS Category Label (1023)"]
+            
+            # Apply gala adjustment
+            if code == "2" and gala_adjustment > 0:
+                adjusted_amount = amount - gala_adjustment
+                lines.append(
+                    f"  {code} - {label}: {format_currency(adjusted_amount)} "
+                    f"(adjusted from {format_currency(amount)})"
+                )
+            elif code == "6" and gala_adjustment > 0:
+                adjusted_amount = amount + gala_adjustment
+                lines.append(
+                    f"  {code} - {label}: {format_currency(adjusted_amount)} "
+                    f"(adjusted from {format_currency(amount)})"
+                )
+            else:
+                lines.append(f"  {code} - {label}: {format_currency(amount)}")
+        
+        # If gala adjustment exists but no Category 6 in data, add it
+        if gala_adjustment > 0 and not has_cat_6:
             lines.append(
-                f"  {r['IRS Category Code (1023)']} - {r['IRS Category Label (1023)']}: {format_currency(r['Amount'])}"
+                f"  6 - Gross receipts from fundraising events: {format_currency(gala_adjustment)} "
+                f"(added via Gala adjustment)"
             )
 
     lines.append("")
@@ -484,7 +522,7 @@ def build_report_1023(year: int, df: pd.DataFrame) -> str:
 # ---------------------------------------------------------------------------
 
 
-def build_report_990(year: int, df: pd.DataFrame) -> str:
+def build_report_990(year: int, df: pd.DataFrame, gala_adjustment: float = 0.0) -> str:
     lines: List[str] = []
 
     lines.append(f"{year} FAOA Form 990 Worksheet (Annual Rollup)")
@@ -496,13 +534,21 @@ def build_report_990(year: int, df: pd.DataFrame) -> str:
     lines.append("All amounts are shown as POSITIVE values for direct entry into tax software.")
     lines.append("")
 
+    # Note gala adjustment if applicable
+    if gala_adjustment > 0:
+        lines.append("NOTE: Gala Revenue Adjustment Applied")
+        lines.append("-" * 50)
+        lines.append(f"  ${gala_adjustment:,.2f} reallocated from Line 1b (Membership dues)")
+        lines.append(f"  to Line 8a (Fundraising event revenue) to correct Stripe commingling.")
+        lines.append("")
+
     df = df.copy()
     df["Itemization_Label_For_990"] = label_for_itemization_990(df)
 
     deposits = df[df["Amount"] > 0].copy()
     withdrawals = df[df["Amount"] < 0].copy()
 
-    # Calculate grand totals
+    # Calculate grand totals (gala adjustment doesn't change total, just reallocation)
     total_revenue = deposits["Amount"].sum() if not deposits.empty else 0
     total_expenses = withdrawals["Amount"].abs().sum() if not withdrawals.empty else 0
     net_change = total_revenue - total_expenses
@@ -581,15 +627,32 @@ def build_report_990(year: int, df: pd.DataFrame) -> str:
             deposits.groupby("__rev_line")["Amount"].sum().reset_index().sort_values("__rev_line")
         )
         
+        # Track if we need to add Line 8a
+        has_line_8a = any("8a" in str(line) for line in rev_rollup["__rev_line"].values)
+        
         for _, r in rev_rollup.iterrows():
             rev_line = r["__rev_line"]
             total = r["Amount"]
             
-            # Format as "Line X - Description: $Amount"
-            if rev_line.startswith("⚠️"):
-                lines.append(f"{rev_line}: {format_currency(total)}")
+            # Apply gala adjustment to membership dues (Line 1b)
+            if "1b" in rev_line and gala_adjustment > 0:
+                adjusted_total = total - gala_adjustment
+                if rev_line.startswith("⚠️"):
+                    lines.append(f"{rev_line}: {format_currency(adjusted_total)} (adjusted from {format_currency(total)})")
+                else:
+                    lines.append(f"Line {rev_line}: {format_currency(adjusted_total)} (adjusted from {format_currency(total)})")
+            # Apply gala adjustment to fundraising revenue (Line 8a) if it exists
+            elif "8a" in rev_line and gala_adjustment > 0:
+                adjusted_total = total + gala_adjustment
+                if rev_line.startswith("⚠️"):
+                    lines.append(f"{rev_line}: {format_currency(adjusted_total)} (adjusted from {format_currency(total)})")
+                else:
+                    lines.append(f"Line {rev_line}: {format_currency(adjusted_total)} (adjusted from {format_currency(total)})")
             else:
-                lines.append(f"Line {rev_line}: {format_currency(total)}")
+                if rev_line.startswith("⚠️"):
+                    lines.append(f"{rev_line}: {format_currency(total)}")
+                else:
+                    lines.append(f"Line {rev_line}: {format_currency(total)}")
 
             # Itemization detail
             sub = deposits[deposits["__rev_line"] == rev_line].copy()
@@ -601,6 +664,17 @@ def build_report_990(year: int, df: pd.DataFrame) -> str:
             )
             for _, rr in sub_group.iterrows():
                 lines.append(f"      • {rr['Itemization_Label_For_990']}: {format_currency(rr['Amount'])}")
+            
+            # Add gala ticket itemization note if this is Line 1b and adjustment applies
+            if "1b" in rev_line and gala_adjustment > 0:
+                lines.append(f"      • [Gala tickets moved to Line 8a]: -${gala_adjustment:,.2f}")
+            
+            lines.append("")
+        
+        # If gala adjustment exists but no Line 8a in data, add it
+        if gala_adjustment > 0 and not has_line_8a:
+            lines.append(f"Line 8a - Gross receipts from fundraising events: {format_currency(gala_adjustment)} (added via Gala adjustment)")
+            lines.append(f"      • Gala ticket sales (via Stripe): {format_currency(gala_adjustment)}")
             lines.append("")
 
         # Donor/sponsor detail for Schedule B preparation
@@ -865,6 +939,36 @@ with st.expander("Data Quality Summary"):
         st.info(f"ℹ️ {len(flagged)} transactions flagged for further investigation")
 
 # ---------------------------------------------------------------------------
+# Gala Revenue Adjustment (Stripe commingling fix)
+# ---------------------------------------------------------------------------
+
+st.header("Step 1b — Gala Revenue Adjustment")
+st.write(
+    "Stripe deposits often combine membership dues and Gala ticket sales into single transactions. "
+    "Enter the **total Gala ticket revenue received via Stripe** for the year to properly allocate it."
+)
+
+if "gala_adjustment" not in st.session_state:
+    st.session_state["gala_adjustment"] = 0.0
+
+gala_input = st.number_input(
+    "Total Gala ticket revenue via Stripe ($)",
+    min_value=0.0,
+    max_value=1000000.0,
+    value=st.session_state["gala_adjustment"],
+    step=100.0,
+    help="This amount will be moved FROM membership dues TO fundraising event revenue in both reports."
+)
+st.session_state["gala_adjustment"] = gala_input
+
+if gala_input > 0:
+    st.info(
+        f"📊 **Adjustment Preview:** ${gala_input:,.2f} will be reallocated:\n\n"
+        f"- **Form 1023:** Category 2 (Membership fees) → Category 6 (Fundraising events)\n"
+        f"- **Form 990:** Line 1b (Membership dues) → Line 8a (Fundraising event revenue)"
+    )
+
+# ---------------------------------------------------------------------------
 # Optional: Preview merged data
 # ---------------------------------------------------------------------------
 
@@ -886,16 +990,16 @@ colA, colB = st.columns(2)
 
 with colA:
     if st.button("Generate 1023 / 990-EZ Annual Text Report"):
-        st.session_state["report_1023"] = build_report_1023(year, merged)
+        st.session_state["report_1023"] = build_report_1023(year, merged, st.session_state["gala_adjustment"])
 
 with colB:
     if st.button("Generate Form 990 Smart Annual Text Report"):
-        st.session_state["report_990"] = build_report_990(year, merged)
+        st.session_state["report_990"] = build_report_990(year, merged, st.session_state["gala_adjustment"])
 
 # Convenience button
 if st.button("Generate BOTH Reports"):
-    st.session_state["report_1023"] = build_report_1023(year, merged)
-    st.session_state["report_990"] = build_report_990(year, merged)
+    st.session_state["report_1023"] = build_report_1023(year, merged, st.session_state["gala_adjustment"])
+    st.session_state["report_990"] = build_report_990(year, merged, st.session_state["gala_adjustment"])
 
 # ---------------------------------------------------------------------------
 # Preview + downloads
