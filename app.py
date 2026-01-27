@@ -1,20 +1,37 @@
 # app.py
+#
+# FAOA Annual Consolidation App (Updated Schema: supports both 1023/990-EZ + Form 990 tagging)
+#
+# What this app does:
+# - Upload 1–12 monthly files (CSV or Excel) produced by the FAOA Monthly Treasurer Tool
+# - Validates schema against the authoritative monthly export format
+# - Robustly de-duplicates transactions across uploads
+# - Generates TWO annual text reports:
+#   (1) Annual 1023 / 990-EZ style report (FAOA categories + itemization)
+#   (2) "Smart" Form 990 worksheet-style report (totals by 990 line + functional categories + itemization)
+# - Optionally downloads a merged annual CSV for recordkeeping
+#
+# Notes:
+# - The app does NOT store any data permanently.
+# - It uses the labels and itemization columns from the monthly exports exactly as provided.
 
-import streamlit as st
+import hashlib
+import io
+from typing import Dict, List, Tuple
+
 import pandas as pd
+import streamlit as st
 
 # ---------------------------------------------------------------------------
 # Basic page config
 # ---------------------------------------------------------------------------
 
-st.set_page_config(
-    page_title="FAOA Annual Report Generator",
-    layout="wide",
-)
+st.set_page_config(page_title="FAOA Annual Consolidation (1023 + 990)", layout="wide")
 
 # ---------------------------------------------------------------------------
 # Password protection
 # ---------------------------------------------------------------------------
+
 
 def check_password():
     """
@@ -37,10 +54,9 @@ def check_password():
         st.session_state["password_correct"] = False
 
     if not st.session_state["password_correct"]:
-        st.title("FAOA Annual Report Generator")
+        st.title("FAOA Annual Consolidation (1023 + 990)")
         st.write("This tool is password protected.")
         password = st.text_input("Enter password", type="password")
-
         if password == "":
             st.stop()
 
@@ -51,643 +67,869 @@ def check_password():
             st.stop()
 
 
-check_password()  # block everything below until password is correct
+check_password()
 
 # ---------------------------------------------------------------------------
-# Main title
+# Title / Description
 # ---------------------------------------------------------------------------
 
-st.title("FAOA Annual Report Generator")
+st.title("FAOA Annual Consolidation (1023 + 990)")
 st.write(
-    "Upload 1–12 monthly exports to generate two annual text reports:\n"
-    "1) An IRS/1023-style annual report (by IRS Category Codes + itemization), and\n"
-    "2) A Form 990 expense rollup report (by Form 990 Expense Line)."
+    "Upload **1–12** monthly files produced by the FAOA Monthly Treasurer Tool (CSV or Excel). "
+    "This app consolidates them into annual outputs and generates two separate tax-ready text reports:\n\n"
+    "1) **Annual 1023 / 990-EZ style report** (FAOA IRS categories + itemization)\n"
+    "2) **Annual Form 990 worksheet report** (totals by 990 line + functional categories + itemization)\n\n"
+    "No data is stored permanently."
 )
 
 # ---------------------------------------------------------------------------
-# Constants / Labels
+# Authoritative schema (derived from your provided monthly export example)
 # ---------------------------------------------------------------------------
 
-REVENUE_CODES = {"1", "2", "3", "4", "6", "7", "9"}
-EXPENSE_CODES = {"14", "15", "16", "18", "19", "22", "23"}
-ALL_CODES = REVENUE_CODES | EXPENSE_CODES
-
-# Canonical IRS labels (used if a code is missing)
-CATEGORY_LABELS = {
-    "1": "Gifts, grants, contributions received",
-    "2": "Membership fees received",
-    "3": "Gross sales of inventory",
-    "4": "Other revenue",
-    "6": "Investment income",
-    "7": "Other revenue",
-    "9": "Gross receipts from activities related to exempt purpose",
-    "14": "Fundraising expenses",
-    "15": "Contributions, gifts, grants paid out",
-    "16": "Disbursements to/for members",
-    "18": "Office expenses",
-    "19": "Travel",
-    "22": "Professional fees",
-    "23": "Other expenses not classified above",
-}
-
-# Strict professional-fees itemization labels allowed
-ALLOWED_PROFESSIONAL_FEE_LABELS = {
-    "Professional Fees (IT Services)",
-    "Professional Fees (Accounting Fees)",
-    "Professional Fees (Legal Fees)",
-    "Professional Fees (Marketing/Advertising)",
-    "Professional Fees (Services)",
-}
-
-PROFESSIONAL_FEES_EXPLANATION = (
-    "Professional fees include external professional services and recurring software platforms "
-    "necessary for FAOA operations, including legal and accounting services; consulting support; "
-    "and SaaS tools for website hosting, membership management, FAO Connect, communications, "
-    "email services, and payment processing."
-)
-
-# Required columns expected in the NEW monthly export format
-HARD_REQUIRED_COLUMNS = {
+REQUIRED_COLUMNS = [
     "Year",
     "Month",
+    "Date",
+    "Description",
     "Amount",
-    "IRS Category Code",
-    "IRS Category Label",
-}
+    "Itemization Preset",
+    "Itemization Label (Common)",
+    "Sponsor Name",
+    "Member/Event Label",
+    "Event Location",
+    "Event Purpose",
+    "Potential Sponsorship",
+    "Needs Further Investigation",
+    "IRS Category (1023)",
+    "IRS Category Code (1023)",
+    "IRS Category Label (1023)",
+    "Itemization Label (1023)",
+    "Form 990 Revenue Line",
+    "Form 990 Expense Line",
+    "Form 990 Functional Category",  # Added: Program, M&G, or Fundraising
+    "Itemization Label (990)",
+]
 
-# Columns that often exist in the new export; we’ll create defaults if missing
-OPTIONAL_COLUMNS_WITH_DEFAULTS = {
-    "Date": "",
-    "Description": "",
-    "Form 990 Expense Line": "",
-    "Itemization Preset": "",
-    "Itemization Label": "",
-    "Member/Event Label": "",
-    "Event Location": "",
-    "Event Purpose": "",
-    "Sponsor Name": "",
-    "Potential Sponsorship": False,
-    "Needs Further Investigation": False,
-}
+# For the 1023 report: which categories count as revenue/expense
+# (Category codes appear as numbers; we store as strings)
+REVENUE_CODES_1023 = {"1", "2", "3", "4", "6", "7", "9"}
+EXPENSE_CODES_1023 = {"14", "15", "16", "18", "19", "22", "23"}
+
+# Explanation text for professional fees (Category 22)
+PROFESSIONAL_FEES_EXPLANATION = (
+    "Professional fees include accounting, legal, and other professional services "
+    "contracted by FAOA to support organizational operations and compliance."
+)
+
+# Valid functional categories for Form 990 Part IX
+VALID_FUNCTIONAL_CATEGORIES = {"Program", "M&G", "Fundraising"}
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def format_currency(value: float) -> str:
-    if pd.isna(value):
+
+def _clean_str(s: pd.Series) -> pd.Series:
+    return s.fillna("").astype(str).str.strip()
+
+
+def _coerce_bool(s: pd.Series) -> pd.Series:
+    # Handles True/False, 1/0, yes/no, y/n, etc.
+    return s.astype(str).str.strip().str.lower().isin(["true", "1", "yes", "y"])
+
+
+def format_currency(x: float) -> str:
+    if pd.isna(x):
         return "$0.00"
-    return f"${value:,.2f}"
+    return f"${x:,.2f}"
 
 
-def clean_str_series(series: pd.Series) -> pd.Series:
-    return series.fillna("").astype(str).str.strip()
-
-
-def coerce_bool_series(series: pd.Series) -> pd.Series:
-    return series.astype(str).str.strip().str.lower().isin(["true", "1", "yes", "y"])
-
-
-def read_uploaded_file(f) -> pd.DataFrame:
-    name = (f.name or "").lower()
+def read_upload(file) -> pd.DataFrame:
+    name = (file.name or "").lower()
     try:
         if name.endswith(".xlsx") or name.endswith(".xls"):
-            return pd.read_excel(f)
-        return pd.read_csv(f)
+            return pd.read_excel(file)
+        return pd.read_csv(file)
     except Exception as e:
-        st.error(f"Error reading file '{f.name}': {e}")
+        st.error(f"Error reading '{file.name}': {e}")
         st.stop()
 
 
-def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
-    missing = HARD_REQUIRED_COLUMNS - set(df.columns)
+def validate_schema(df: pd.DataFrame, filename: str):
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing:
         st.error(
-            f"Missing required columns: {', '.join(sorted(missing))}. "
-            "Please upload exports from the FAOA Monthly Treasurer Tool (new format)."
+            f"File '{filename}' is missing required column(s): {', '.join(missing)}.\n\n"
+            "This annual app expects the exact monthly export schema."
         )
         st.stop()
 
-    # Add optional columns if missing
-    for col, default in OPTIONAL_COLUMNS_WITH_DEFAULTS.items():
-        if col not in df.columns:
-            df[col] = default
 
-    # Numeric coercion
-    for col in ["Year", "Month", "Amount"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+def normalize_types(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    # numeric
+    df["Year"] = pd.to_numeric(df["Year"], errors="coerce")
+    df["Month"] = pd.to_numeric(df["Month"], errors="coerce")
+    df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
 
     if df[["Year", "Month", "Amount"]].isna().any().any():
-        st.error("Invalid numeric values detected in Year, Month, or Amount.")
+        st.error("Invalid numeric values found in Year, Month, or Amount.")
         st.stop()
 
-    # Clean strings
+    # strings
     str_cols = [
         "Date",
         "Description",
-        "IRS Category Code",
-        "IRS Category Label",
-        "Form 990 Expense Line",
         "Itemization Preset",
-        "Itemization Label",
+        "Itemization Label (Common)",
+        "Sponsor Name",
         "Member/Event Label",
         "Event Location",
         "Event Purpose",
-        "Sponsor Name",
+        "IRS Category (1023)",
+        "IRS Category Code (1023)",
+        "IRS Category Label (1023)",
+        "Itemization Label (1023)",
+        "Form 990 Revenue Line",
+        "Form 990 Expense Line",
+        "Form 990 Functional Category",
+        "Itemization Label (990)",
     ]
     for c in str_cols:
-        if c in df.columns:
-            df[c] = clean_str_series(df[c])
+        df[c] = _clean_str(df[c])
 
-    # Booleans
-    for c in ["Potential Sponsorship", "Needs Further Investigation"]:
-        if c in df.columns:
-            df[c] = coerce_bool_series(df[c])
-        else:
-            df[c] = False
+    # booleans
+    df["Potential Sponsorship"] = _coerce_bool(df["Potential Sponsorship"])
+    df["Needs Further Investigation"] = _coerce_bool(df["Needs Further Investigation"])
 
-    # Force codes to string for grouping consistency
-    df["IRS Category Code"] = df["IRS Category Code"].astype(str).str.strip()
+    # normalize code to string
+    df["IRS Category Code (1023)"] = _clean_str(df["IRS Category Code (1023)"])
 
     return df
 
 
-def validate_year(df: pd.DataFrame) -> int:
+def build_transaction_fingerprint(row: pd.Series) -> str:
+    """
+    Robust transaction de-dupe key.
+
+    We intentionally use a stable subset that should be identical for the same transaction:
+    Year, Month, Date, Description, Amount.
+
+    - If you later add a RowID column in the monthly export, you can incorporate it here.
+    """
+    parts = [
+        str(int(row["Year"])) if pd.notna(row["Year"]) else "",
+        str(int(row["Month"])) if pd.notna(row["Month"]) else "",
+        row.get("Date", ""),
+        row.get("Description", ""),
+        # Normalize amount to cents to avoid floating drift
+        f"{float(row.get('Amount', 0.0)):.2f}",
+    ]
+    raw = "||".join(parts).strip().lower()
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def dedupe_transactions(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
+    df = df.copy()
+    df["_tx_fingerprint"] = df.apply(build_transaction_fingerprint, axis=1)
+    before = len(df)
+    df = df.drop_duplicates(subset=["_tx_fingerprint"]).drop(columns=["_tx_fingerprint"])
+    removed = before - len(df)
+    return df, removed
+
+
+def validate_single_year(df: pd.DataFrame) -> int:
     years = sorted(df["Year"].dropna().unique())
     if len(years) != 1:
-        st.error(f"All uploaded files must be from one year. Found years: {years}")
+        st.error(f"Uploaded files must all be for a single year. Found years: {years}")
         st.stop()
     return int(years[0])
 
 
-def validate_categories(df: pd.DataFrame):
-    codes = set(df["IRS Category Code"].astype(str).unique())
-    unknown = codes - ALL_CODES
-    if unknown:
-        st.error("Unexpected IRS Category Codes: " + ", ".join(sorted(unknown)))
-        st.stop()
+def month_coverage(df: pd.DataFrame) -> Tuple[List[int], List[int]]:
+    months = sorted(set(int(m) for m in df["Month"].dropna().tolist() if 1 <= int(m) <= 12))
+    missing = [m for m in range(1, 13) if m not in months]
+    return months, missing
 
 
-def normalize_itemization_labels(df: pd.DataFrame) -> pd.DataFrame:
+def label_for_itemization_1023(df: pd.DataFrame) -> pd.Series:
     """
-    - Replace blank Itemization Label with 'Not itemized' (for reporting only).
+    For 1023 itemization: prefer 'Itemization Label (1023)' if present; else fallback to common label.
+    Never blank in reports: use 'Not itemized'.
     """
-    df = df.copy()
-    df["Itemization Label"] = clean_str_series(df["Itemization Label"])
-    df.loc[df["Itemization Label"] == "", "Itemization Label"] = "Not itemized"
-    return df
+    lbl = df["Itemization Label (1023)"].copy()
+    lbl = lbl.where(lbl.str.strip() != "", df["Itemization Label (Common)"])
+    lbl = lbl.where(lbl.str.strip() != "", "Not itemized")
+    return lbl
 
 
-def enforce_professional_fees_rules(df: pd.DataFrame) -> pd.DataFrame:
+def label_for_itemization_990(df: pd.DataFrame) -> pd.Series:
     """
-    If a transaction is a professional fee (based on the Itemization Label prefix),
-    then force IRS Category Code to 22 and enforce allowed labels.
-    Invalid professional-fee labels are flagged for investigation.
+    For 990 itemization: prefer 'Itemization Label (990)' if present; else fallback to common label.
+    Never blank in reports: use 'Not itemized'.
     """
-    df = df.copy()
-
-    # Identify professional fees by label pattern
-    label = clean_str_series(df["Itemization Label"])
-    is_prof_fee = label.str.startswith("Professional Fees (", na=False)
-
-    # Force recode to Category 22
-    df.loc[is_prof_fee, "IRS Category Code"] = "22"
-    df.loc[is_prof_fee, "IRS Category Label"] = "Professional fees"
-
-    # Validate allowed professional-fee labels
-    invalid_prof_fee = is_prof_fee & (~label.isin(ALLOWED_PROFESSIONAL_FEE_LABELS))
-    if invalid_prof_fee.any():
-        df.loc[invalid_prof_fee, "Needs Further Investigation"] = True
-
-    return df
-
-
-def build_summary_table(df: pd.DataFrame) -> pd.DataFrame:
-    summary = (
-        df.groupby(["IRS Category Code", "IRS Category Label"], dropna=False)["Amount"]
-        .sum()
-        .reset_index(name="Raw Total Amount")
-    )
-    summary["Adjusted Total Amount"] = summary["Raw Total Amount"]
-    summary["__sort"] = pd.to_numeric(summary["IRS Category Code"], errors="coerce")
-    summary = summary.sort_values("__sort").drop(columns="__sort").reset_index(drop=True)
-    return summary
-
-
-def ensure_category_rows_exist(summary_df: pd.DataFrame, codes_needed: set) -> pd.DataFrame:
-    existing = set(summary_df["IRS Category Code"].astype(str).unique())
-    missing = {c for c in codes_needed if c not in existing}
-    if not missing:
-        return summary_df
-
-    new_rows = []
-    for code in sorted(missing, key=lambda x: int(x)):
-        new_rows.append({
-            "IRS Category Code": code,
-            "IRS Category Label": CATEGORY_LABELS.get(code, ""),
-            "Raw Total Amount": 0.0,
-            "Adjusted Total Amount": 0.0,
-        })
-
-    combined = pd.concat([summary_df, pd.DataFrame(new_rows)], ignore_index=True)
-    combined["__sort"] = pd.to_numeric(combined["IRS Category Code"], errors="coerce")
-    combined = combined.sort_values("__sort").drop(columns="__sort").reset_index(drop=True)
-    return combined
-
-
-def apply_gala_ticket_reclass(summary_df: pd.DataFrame, gala_amount: float) -> pd.DataFrame:
-    """
-    Subtract gala_amount from Adjusted Total for category 2,
-    add gala_amount to Adjusted Total for category 9.
-    Raw totals remain unchanged.
-    """
-    summary_df = ensure_category_rows_exist(summary_df, {"2", "9"})
-
-    gala_amount = float(gala_amount or 0.0)
-    if gala_amount < 0:
-        st.error("Gala ticket amount cannot be negative.")
-        st.stop()
-
-    idx2 = summary_df.index[summary_df["IRS Category Code"] == "2"].tolist()
-    idx9 = summary_df.index[summary_df["IRS Category Code"] == "9"].tolist()
-
-    raw2 = float(summary_df.loc[idx2[0], "Raw Total Amount"]) if idx2 else 0.0
-
-    if gala_amount > raw2 + 1e-9:
-        st.error(
-            f"Gala ticket amount ({format_currency(gala_amount)}) cannot exceed the raw total for "
-            f'Category 2 ({format_currency(raw2)}).'
-        )
-        st.stop()
-
-    summary_df.loc[idx2[0], "Adjusted Total Amount"] = float(summary_df.loc[idx2[0], "Adjusted Total Amount"]) - gala_amount
-    summary_df.loc[idx9[0], "Adjusted Total Amount"] = float(summary_df.loc[idx9[0], "Adjusted Total Amount"]) + gala_amount
-
-    return summary_df
-
-
-def group_amounts_by_label(cat_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Group by Itemization Label and return sorted totals.
-    Assumes Itemization Label already normalized (no blanks).
-    """
-    g = (
-        cat_df.groupby("Itemization Label")["Amount"]
-        .sum()
-        .reset_index()
-        .sort_values("Itemization Label")
-    )
-    return g
+    lbl = df["Itemization Label (990)"].copy()
+    lbl = lbl.where(lbl.str.strip() != "", df["Itemization Label (Common)"])
+    lbl = lbl.where(lbl.str.strip() != "", "Not itemized")
+    return lbl
 
 
 # ---------------------------------------------------------------------------
-# REPORT A: IRS/1023-style Annual Report (IRS Category rollup + itemization)
+# Report 1: Annual 1023 / 990-EZ style report
 # ---------------------------------------------------------------------------
 
-def build_report_a_annual_irs(year: int, summary_df: pd.DataFrame, full_df: pd.DataFrame, gala_ticket_amount: float) -> str:
-    lines = []
 
-    lines.append(f"{year} Foreign Area Officer Association Annual Financial Report")
+def build_report_1023(year: int, df: pd.DataFrame) -> str:
+    lines: List[str] = []
+
+    lines.append(f"{year} Foreign Area Officer Association Annual Financial Report (1023 / 990-EZ Style)")
     lines.append("Foreign Area Officer Association (FAOA)")
-    lines.append("------------------------------------------------------------")
+    lines.append("=" * 70)
     lines.append("")
 
-    # Revenue summary (Adjusted)
-    lines.append("REVENUE CATEGORIES")
-    rev_summary = summary_df[summary_df["IRS Category Code"].isin(REVENUE_CODES)].copy()
-    rev_summary["__sort"] = pd.to_numeric(rev_summary["IRS Category Code"], errors="coerce")
-    rev_summary = rev_summary.sort_values("__sort").drop(columns="__sort")
-    if rev_summary.empty:
+    # Summary totals by 1023 category
+    df = df.copy()
+    df["__code"] = df["IRS Category Code (1023)"].astype(str)
+
+    # Calculate grand totals
+    total_revenue = df[df["__code"].isin(REVENUE_CODES_1023)]["Amount"].sum()
+    total_expenses = df[df["__code"].isin(EXPENSE_CODES_1023)]["Amount"].abs().sum()
+    net_change = total_revenue - total_expenses
+
+    lines.append("SUMMARY")
+    lines.append("-" * 40)
+    lines.append(f"  Total Revenue:  {format_currency(total_revenue)}")
+    lines.append(f"  Total Expenses: {format_currency(total_expenses)}")
+    lines.append(f"  Net Change:     {format_currency(net_change)}")
+    lines.append("")
+
+    # Revenue summary
+    lines.append("REVENUE CATEGORIES (by IRS Category Code 1023)")
+    lines.append("-" * 40)
+    rev = df[df["__code"].isin(REVENUE_CODES_1023)]
+    if rev.empty:
         lines.append("  (No revenue recorded for this period.)")
     else:
+        rev_summary = (
+            rev.groupby(["IRS Category Code (1023)", "IRS Category Label (1023)"])["Amount"]
+            .sum()
+            .reset_index()
+        )
+        rev_summary["__sort"] = pd.to_numeric(rev_summary["IRS Category Code (1023)"], errors="coerce")
+        rev_summary = rev_summary.sort_values("__sort").drop(columns="__sort")
         for _, r in rev_summary.iterrows():
             lines.append(
-                f"  {r['IRS Category Code']} - {r['IRS Category Label']}: {format_currency(r['Adjusted Total Amount'])}"
+                f"  {r['IRS Category Code (1023)']} - {r['IRS Category Label (1023)']}: {format_currency(r['Amount'])}"
             )
 
     lines.append("")
-
-    # Expense summary (Adjusted)
-    lines.append("EXPENSE CATEGORIES")
-    exp_summary = summary_df[summary_df["IRS Category Code"].isin(EXPENSE_CODES)].copy()
-    exp_summary["__sort"] = pd.to_numeric(exp_summary["IRS Category Code"], errors="coerce")
-    exp_summary = exp_summary.sort_values("__sort").drop(columns="__sort")
-    if exp_summary.empty:
+    lines.append("EXPENSE CATEGORIES (by IRS Category Code 1023)")
+    lines.append("-" * 40)
+    exp = df[df["__code"].isin(EXPENSE_CODES_1023)]
+    if exp.empty:
         lines.append("  (No expenses recorded for this period.)")
     else:
+        exp_summary = (
+            exp.groupby(["IRS Category Code (1023)", "IRS Category Label (1023)"])["Amount"]
+            .sum()
+            .reset_index()
+        )
+        exp_summary["__sort"] = pd.to_numeric(exp_summary["IRS Category Code (1023)"], errors="coerce")
+        exp_summary = exp_summary.sort_values("__sort").drop(columns="__sort")
         for _, r in exp_summary.iterrows():
+            # Show expenses as positive values for clarity
             lines.append(
-                f"  {r['IRS Category Code']} - {r['IRS Category Label']}: {format_currency(r['Adjusted Total Amount'])}"
+                f"  {r['IRS Category Code (1023)']} - {r['IRS Category Label (1023)']}: {format_currency(abs(r['Amount']))}"
             )
 
     # Itemized revenue
     lines.append("")
-    lines.append("ITEMIZED REVENUE")
+    lines.append("=" * 70)
+    lines.append("ITEMIZED REVENUE (by 1023 category + itemization label)")
+    lines.append("=" * 70)
     lines.append("")
 
-    gala_ticket_amount = float(gala_ticket_amount or 0.0)
+    if rev.empty:
+        lines.append("  (No itemized revenue entries.)")
+    else:
+        rev = rev.copy()
+        rev["Itemization_Label_For_Report"] = label_for_itemization_1023(rev)
 
-    rev_df = full_df[full_df["IRS Category Code"].isin(REVENUE_CODES)].copy()
-    rev_df = normalize_itemization_labels(rev_df)
-
-    any_rev = False
-
-    # Sponsors (Cat 1): prefer Sponsor Name grouping
-    cat1 = rev_df[rev_df["IRS Category Code"] == "1"].copy()
-    if not cat1.empty:
-        any_rev = True
-        label = cat1["IRS Category Label"].iloc[0]
-        lines.append(f"  Category 1 – {label}:")
-        if cat1["Sponsor Name"].str.strip().ne("").any():
+        # Sponsorship / donor totals by Sponsor Name (where Sponsor Name present)
+        sponsor = rev[rev["Sponsor Name"].str.strip() != ""]
+        if not sponsor.empty:
+            lines.append("SPONSORSHIP / DONOR TOTALS (by Sponsor Name)")
+            lines.append("-" * 40)
             sponsor_group = (
-                cat1[cat1["Sponsor Name"].str.strip() != ""]
-                .groupby("Sponsor Name")["Amount"]
-                .sum()
-                .reset_index()
-                .sort_values("Sponsor Name")
+                sponsor.groupby("Sponsor Name")["Amount"].sum().reset_index().sort_values("Sponsor Name")
             )
             for _, r in sponsor_group.iterrows():
-                lines.append(f"    {r['Sponsor Name']}: {format_currency(r['Amount'])}")
-        else:
-            grouped = group_amounts_by_label(cat1)
-            for _, r in grouped.iterrows():
-                lines.append(f"    {r['Itemization Label']}: {format_currency(r['Amount'])}")
+                lines.append(f"  {r['Sponsor Name']}: {format_currency(r['Amount'])}")
+            lines.append("")
 
-    # Other revenue codes (force Cat 9 if gala amount > 0)
-    for code in sorted(REVENUE_CODES - {"1"}, key=int):
-        cat_df = rev_df[rev_df["IRS Category Code"] == code].copy()
+        # Itemize revenue by category then itemization label
+        for code in sorted(REVENUE_CODES_1023, key=lambda x: int(x)):
+            cat = rev[rev["IRS Category Code (1023)"] == code].copy()
+            if cat.empty:
+                continue
 
-        if cat_df.empty and not (code == "9" and gala_ticket_amount > 0.0):
-            continue
+            label = cat["IRS Category Label (1023)"].iloc[0]
+            cat_total = cat["Amount"].sum()
+            lines.append(f"Category {code} – {label}: {format_currency(cat_total)}")
+            lines.append("-" * 40)
 
-        any_rev = True
-        label = cat_df["IRS Category Label"].iloc[0] if not cat_df.empty else CATEGORY_LABELS.get(code, "")
-        lines.append(f"  Category {code} – {label}:")
-
-        if code == "9" and gala_ticket_amount > 0.0:
-            lines.append(f"    Gala Tickets: {format_currency(gala_ticket_amount)}")
-
-        if not cat_df.empty:
-            grouped = group_amounts_by_label(cat_df)
-            for _, r in grouped.iterrows():
-                lines.append(f"    {r['Itemization Label']}: {format_currency(r['Amount'])}")
-
-    if not any_rev:
-        lines.append("  (No itemized revenue entries.)")
+            group = (
+                cat.groupby("Itemization_Label_For_Report")["Amount"]
+                .sum()
+                .reset_index()
+                .sort_values("Itemization_Label_For_Report")
+            )
+            for _, r in group.iterrows():
+                lines.append(f"    {r['Itemization_Label_For_Report']}: {format_currency(r['Amount'])}")
+            lines.append("")
 
     # Itemized expenses
     lines.append("")
-    lines.append("ITEMIZED EXPENSES")
+    lines.append("=" * 70)
+    lines.append("ITEMIZED EXPENSES (by 1023 category + itemization label)")
+    lines.append("=" * 70)
     lines.append("")
 
-    exp_df = full_df[full_df["IRS Category Code"].isin(EXPENSE_CODES)].copy()
-    exp_df = normalize_itemization_labels(exp_df)
-
-    if exp_df.empty:
+    if exp.empty:
         lines.append("  (No itemized expense entries.)")
     else:
-        for code in sorted(EXPENSE_CODES, key=int):
-            cat_df = exp_df[exp_df["IRS Category Code"] == code].copy()
-            if cat_df.empty:
+        exp = exp.copy()
+        exp["Itemization_Label_For_Report"] = label_for_itemization_1023(exp)
+
+        # Category 16: event detail listing (if present)
+        cat16 = exp[exp["IRS Category Code (1023)"] == "16"].copy()
+        if not cat16.empty and (
+            cat16["Member/Event Label"].str.strip().ne("").any()
+            or cat16["Event Location"].str.strip().ne("").any()
+            or cat16["Event Purpose"].str.strip().ne("").any()
+        ):
+            lines.append("CATEGORY 16 – EVENTS (line-item detail)")
+            lines.append("-" * 70)
+            lines.append("  Date | Event | Location | Purpose | Amount | Description")
+            lines.append("  " + "-" * 66)
+            cat16 = cat16.sort_values(["Date", "Member/Event Label", "Description"])
+            for _, r in cat16.iterrows():
+                lines.append(
+                    f"  {r['Date']} | {r['Member/Event Label']} | {r['Event Location']} | {r['Event Purpose']} | "
+                    f"{format_currency(abs(r['Amount']))} | {r['Description']}"
+                )
+            lines.append("")
+
+        # Itemize expenses by category
+        for code in sorted(EXPENSE_CODES_1023, key=lambda x: int(x)):
+            cat = exp[exp["IRS Category Code (1023)"] == code].copy()
+            if cat.empty:
                 continue
 
-            label = cat_df["IRS Category Label"].iloc[0]
-            lines.append(f"  Category {code} – {label}:")
+            label = cat["IRS Category Label (1023)"].iloc[0]
+            cat_total = cat["Amount"].abs().sum()
+            lines.append(f"Category {code} – {label}: {format_currency(cat_total)}")
+            lines.append("-" * 40)
 
-            # Put the professional-fees explanation INSIDE category 22
+            # Add professional fees explanation for Category 22
             if code == "22":
-                lines.append(f"    {PROFESSIONAL_FEES_EXPLANATION}")
-
-                # Ensure professional-fee labels are present and valid where applicable
-                # (If blank, it will show as "Not itemized" and should be fixed upstream)
+                lines.append(f"    Note: {PROFESSIONAL_FEES_EXPLANATION}")
                 lines.append("")
 
-            grouped = group_amounts_by_label(cat_df)
-            for _, r in grouped.iterrows():
-                lines.append(f"    {r['Itemization Label']}: {format_currency(r['Amount'])}")
+            group = (
+                cat.groupby("Itemization_Label_For_Report")["Amount"]
+                .apply(lambda x: abs(x).sum())
+                .reset_index()
+                .sort_values("Itemization_Label_For_Report")
+            )
+            for _, r in group.iterrows():
+                lines.append(f"    {r['Itemization_Label_For_Report']}: {format_currency(r['Amount'])}")
+            lines.append("")
 
     # Needs Further Investigation
     lines.append("")
-    lines.append("NEEDS FURTHER INVESTIGATION (Treasurer Flagged / Validation Flags)")
-    flagged = full_df[full_df["Needs Further Investigation"] == True].copy()
+    lines.append("=" * 70)
+    lines.append("NEEDS FURTHER INVESTIGATION")
+    lines.append("=" * 70)
+    flagged = df[df["Needs Further Investigation"] == True].copy()
     if flagged.empty:
         lines.append("  (None flagged this period.)")
     else:
         lines.append(f"  Count of flagged transactions: {len(flagged)}")
         lines.append(f"  Net total of flagged amounts: {format_currency(flagged['Amount'].sum())}")
-        # Light detail (no sensitive dump)
-        flagged = normalize_itemization_labels(flagged)
-        sample = flagged[["Date", "Description", "Amount", "IRS Category Code", "Itemization Label"]].head(20)
-        lines.append("  Sample (first 20):")
-        for _, r in sample.iterrows():
+        lines.append("")
+        # Optional detail list (kept readable, not a full dump)
+        flagged = flagged.sort_values(["Month", "Date", "Description"])
+        lines.append("  Flagged line items (up to first 50):")
+        lines.append("  " + "-" * 66)
+        show = flagged.head(50)
+        for _, r in show.iterrows():
             lines.append(
-                f"    {r['Date']} | {r['IRS Category Code']} | {r['Itemization Label']} | {format_currency(r['Amount'])} | {r['Description']}"
+                f"    {int(r['Month']):02d}/{int(r['Year'])} | {r['Date']} | {format_currency(r['Amount'])} | "
+                f"{r['IRS Category Code (1023)']} | {r['Description']}"
             )
+        if len(flagged) > 50:
+            lines.append("    ... (more flagged items not shown)")
 
     lines.append("")
-    lines.append("End of report.")
+    lines.append("=" * 70)
+    lines.append("End of 1023 / 990-EZ Annual Report")
+    lines.append("=" * 70)
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# REPORT B: Form 990 Expense Rollup Report (by Form 990 Expense Line)
+# Report 2: Smart annual report for Form 990 preparation
 # ---------------------------------------------------------------------------
 
-def build_report_b_form_990(year: int, full_df: pd.DataFrame) -> str:
-    lines = []
 
-    lines.append(f"{year} FAOA Form 990 Expense Rollup Report")
+def build_report_990(year: int, df: pd.DataFrame) -> str:
+    lines: List[str] = []
+
+    lines.append(f"{year} FAOA Form 990 Worksheet (Annual Rollup)")
     lines.append("Foreign Area Officer Association (FAOA)")
-    lines.append("------------------------------------------------------------")
+    lines.append("EIN: [Enter EIN]")
+    lines.append("=" * 80)
     lines.append("")
-    lines.append("This report consolidates EXPENSES by the 'Form 990 Expense Line' field from the monthly exports.")
+    lines.append("PURPOSE: This worksheet provides line-by-line totals for Form 990 data entry.")
+    lines.append("All amounts are shown as POSITIVE values for direct entry into tax software.")
     lines.append("")
 
-    exp_df = full_df[full_df["IRS Category Code"].isin(EXPENSE_CODES)].copy()
-    if exp_df.empty:
-        lines.append("(No expenses recorded for this period.)")
+    df = df.copy()
+    df["Itemization_Label_For_990"] = label_for_itemization_990(df)
+
+    deposits = df[df["Amount"] > 0].copy()
+    withdrawals = df[df["Amount"] < 0].copy()
+
+    # Calculate grand totals
+    total_revenue = deposits["Amount"].sum() if not deposits.empty else 0
+    total_expenses = withdrawals["Amount"].abs().sum() if not withdrawals.empty else 0
+    net_change = total_revenue - total_expenses
+
+    # =========================================================================
+    # QUICK REFERENCE: KEY FORM 990 TOTALS
+    # =========================================================================
+    lines.append("=" * 80)
+    lines.append("QUICK REFERENCE: KEY FORM 990 LINE ENTRIES")
+    lines.append("=" * 80)
+    lines.append("")
+    lines.append("Copy these totals directly into Form 990:")
+    lines.append("")
+    lines.append("PART I - SUMMARY")
+    lines.append("-" * 50)
+    lines.append(f"  Line 8   Total revenue (Part VIII, line 12):     {format_currency(total_revenue)}")
+    lines.append(f"  Line 18  Total expenses (Part IX, line 25):      {format_currency(total_expenses)}")
+    lines.append(f"  Line 19  Revenue less expenses:                  {format_currency(net_change)}")
+    lines.append("")
+
+    # Compute functional totals for quick reference
+    if not withdrawals.empty:
+        withdrawals["AbsAmount"] = withdrawals["Amount"].abs()
+        withdrawals["__func_cat"] = _clean_str(withdrawals["Form 990 Functional Category"])
+        
+        prog_total = withdrawals[withdrawals["__func_cat"] == "Program"]["AbsAmount"].sum()
+        mg_total = withdrawals[withdrawals["__func_cat"] == "M&G"]["AbsAmount"].sum()
+        fund_total = withdrawals[withdrawals["__func_cat"] == "Fundraising"]["AbsAmount"].sum()
+        unallocated = withdrawals[~withdrawals["__func_cat"].isin(VALID_FUNCTIONAL_CATEGORIES)]["AbsAmount"].sum()
+    else:
+        prog_total = mg_total = fund_total = unallocated = 0
+
+    lines.append("PART IX - FUNCTIONAL EXPENSE COLUMN TOTALS (Line 25)")
+    lines.append("-" * 50)
+    lines.append(f"  Column (A) Total expenses:        {format_currency(total_expenses)}")
+    lines.append(f"  Column (B) Program services:      {format_currency(prog_total)}")
+    lines.append(f"  Column (C) Management & General:  {format_currency(mg_total)}")
+    lines.append(f"  Column (D) Fundraising:           {format_currency(fund_total)}")
+    if unallocated > 0:
+        lines.append(f"  ⚠️  UNALLOCATED (needs category):  {format_currency(unallocated)}")
+    lines.append("")
+
+    # Schedule B check
+    if not deposits.empty:
+        sponsor = deposits[deposits["Sponsor Name"].str.strip() != ""]
+        if not sponsor.empty:
+            sponsor_totals = sponsor.groupby("Sponsor Name")["Amount"].sum()
+            large_donors = sponsor_totals[sponsor_totals >= 5000]
+            if not large_donors.empty:
+                lines.append("⚠️  SCHEDULE B REQUIRED: Donors with contributions ≥$5,000")
+                lines.append("-" * 50)
+                for name, amt in large_donors.items():
+                    lines.append(f"  {name}: {format_currency(amt)}")
+                lines.append("")
+
+    # =========================================================================
+    # PART VIII: STATEMENT OF REVENUE (DETAILED)
+    # =========================================================================
+    lines.append("=" * 80)
+    lines.append("PART VIII: STATEMENT OF REVENUE (Detailed)")
+    lines.append("=" * 80)
+    lines.append("")
+
+    if deposits.empty:
+        lines.append("  (No revenue recorded for this period.)")
         lines.append("")
-        lines.append("End of report.")
-        return "\n".join(lines)
+    else:
+        deposits["Form 990 Revenue Line"] = _clean_str(deposits["Form 990 Revenue Line"])
+        deposits["__rev_line"] = deposits["Form 990 Revenue Line"].where(
+            deposits["Form 990 Revenue Line"].str.strip() != "",
+            "⚠️ MISSING LINE TAG",
+        )
 
-    exp_df = normalize_itemization_labels(exp_df)
-    exp_df["Form 990 Expense Line"] = clean_str_series(exp_df["Form 990 Expense Line"])
-    exp_df.loc[exp_df["Form 990 Expense Line"] == "", "Form 990 Expense Line"] = "UNASSIGNED (Needs review)"
+        # Group and sort by line number
+        rev_rollup = (
+            deposits.groupby("__rev_line")["Amount"].sum().reset_index().sort_values("__rev_line")
+        )
+        
+        for _, r in rev_rollup.iterrows():
+            rev_line = r["__rev_line"]
+            total = r["Amount"]
+            
+            # Format as "Line X - Description: $Amount"
+            if rev_line.startswith("⚠️"):
+                lines.append(f"{rev_line}: {format_currency(total)}")
+            else:
+                lines.append(f"Line {rev_line}: {format_currency(total)}")
 
-    # Rollup totals by 990 line
-    rollup = (
-        exp_df.groupby("Form 990 Expense Line")["Amount"]
-        .sum()
-        .reset_index()
-        .sort_values("Form 990 Expense Line")
-    )
+            # Itemization detail
+            sub = deposits[deposits["__rev_line"] == rev_line].copy()
+            sub_group = (
+                sub.groupby("Itemization_Label_For_990")["Amount"]
+                .sum()
+                .reset_index()
+                .sort_values("Itemization_Label_For_990")
+            )
+            for _, rr in sub_group.iterrows():
+                lines.append(f"      • {rr['Itemization_Label_For_990']}: {format_currency(rr['Amount'])}")
+            lines.append("")
 
-    for _, row in rollup.iterrows():
-        line_name = row["Form 990 Expense Line"]
-        total = row["Amount"]
-        lines.append(f"{line_name}: {format_currency(total)}")
+        # Donor/sponsor detail for Schedule B preparation
+        sponsor = deposits[deposits["Sponsor Name"].str.strip() != ""]
+        if not sponsor.empty:
+            lines.append("-" * 50)
+            lines.append("CONTRIBUTOR DETAIL (for Schedule B preparation)")
+            lines.append("-" * 50)
+            sgroup = sponsor.groupby("Sponsor Name")["Amount"].sum().reset_index().sort_values("Amount", ascending=False)
+            for _, sr in sgroup.iterrows():
+                flag = " ⬅ Schedule B" if sr["Amount"] >= 5000 else ""
+                lines.append(f"  {sr['Sponsor Name']}: {format_currency(sr['Amount'])}{flag}")
+            lines.append("")
 
-        line_df = exp_df[exp_df["Form 990 Expense Line"] == line_name].copy()
+        # Missing tags warning
+        missing_rev = deposits[deposits["Form 990 Revenue Line"].str.strip() == ""].copy()
+        if not missing_rev.empty:
+            lines.append("⚠️  ACTION REQUIRED: MISSING REVENUE LINE TAGS")
+            lines.append("-" * 50)
+            lines.append(f"  Count: {len(missing_rev)} transactions")
+            lines.append(f"  Total: {format_currency(missing_rev['Amount'].sum())}")
+            lines.append("  Transactions needing correction:")
+            show = missing_rev.sort_values(["Month", "Date"]).head(25)
+            for _, mr in show.iterrows():
+                lines.append(f"    {int(mr['Month']):02d}/{mr['Date']} | {format_currency(mr['Amount'])} | {mr['Description'][:50]}")
+            if len(missing_rev) > 25:
+                lines.append(f"    ... and {len(missing_rev) - 25} more")
+            lines.append("")
 
-        # Itemize within each 990 line by Itemization Label
-        grouped = group_amounts_by_label(line_df)
-        for _, r in grouped.iterrows():
-            lines.append(f"  {r['Itemization Label']}: {format_currency(r['Amount'])}")
+    # =========================================================================
+    # PART IX: STATEMENT OF FUNCTIONAL EXPENSES (DETAILED)
+    # =========================================================================
+    lines.append("=" * 80)
+    lines.append("PART IX: STATEMENT OF FUNCTIONAL EXPENSES (Detailed)")
+    lines.append("=" * 80)
+    lines.append("")
+    lines.append("Each line shows: Total (A) | Program (B) | M&G (C) | Fundraising (D)")
+    lines.append("")
 
+    if withdrawals.empty:
+        lines.append("  (No expenses recorded for this period.)")
+    else:
+        withdrawals["Form 990 Expense Line"] = _clean_str(withdrawals["Form 990 Expense Line"])
+        withdrawals["__exp_line"] = withdrawals["Form 990 Expense Line"].where(
+            withdrawals["Form 990 Expense Line"].str.strip() != "",
+            "⚠️ MISSING LINE TAG",
+        )
+        
+        withdrawals["__func_cat_display"] = withdrawals["__func_cat"].where(
+            withdrawals["__func_cat"].isin(VALID_FUNCTIONAL_CATEGORIES),
+            "UNALLOCATED"
+        )
+
+        # Process each expense line
+        for exp_line in sorted(withdrawals["__exp_line"].unique()):
+            exp_subset = withdrawals[withdrawals["__exp_line"] == exp_line]
+            
+            line_total = exp_subset["AbsAmount"].sum()
+            prog_amt = exp_subset[exp_subset["__func_cat"] == "Program"]["AbsAmount"].sum()
+            mg_amt = exp_subset[exp_subset["__func_cat"] == "M&G"]["AbsAmount"].sum()
+            fund_amt = exp_subset[exp_subset["__func_cat"] == "Fundraising"]["AbsAmount"].sum()
+            unalloc_amt = exp_subset[~exp_subset["__func_cat"].isin(VALID_FUNCTIONAL_CATEGORIES)]["AbsAmount"].sum()
+
+            # Line header
+            if exp_line.startswith("⚠️"):
+                lines.append(f"{exp_line}")
+            else:
+                lines.append(f"Line {exp_line}")
+            
+            lines.append(f"  (A) Total:       {format_currency(line_total)}")
+            lines.append(f"  (B) Program:     {format_currency(prog_amt)}")
+            lines.append(f"  (C) M&G:         {format_currency(mg_amt)}")
+            lines.append(f"  (D) Fundraising: {format_currency(fund_amt)}")
+            if unalloc_amt > 0:
+                lines.append(f"  ⚠️  Unallocated:  {format_currency(unalloc_amt)}")
+
+            # Itemization
+            lines.append("  Itemization:")
+            sub_group = (
+                exp_subset.groupby("Itemization_Label_For_990")["AbsAmount"]
+                .sum()
+                .reset_index()
+                .sort_values("AbsAmount", ascending=False)
+            )
+            for _, rr in sub_group.iterrows():
+                lines.append(f"      • {rr['Itemization_Label_For_990']}: {format_currency(rr['AbsAmount'])}")
+            lines.append("")
+
+        # Summary table
+        lines.append("-" * 80)
+        lines.append("PART IX LINE 25 - TOTAL FUNCTIONAL EXPENSES")
+        lines.append("-" * 80)
+        lines.append(f"  (A) Total expenses:        {format_currency(total_expenses)}")
+        lines.append(f"  (B) Program services:      {format_currency(prog_total)}")
+        lines.append(f"  (C) Management & General:  {format_currency(mg_total)}")
+        lines.append(f"  (D) Fundraising:           {format_currency(fund_total)}")
         lines.append("")
 
-    lines.append("End of report.")
+        # Missing tags warnings
+        missing_exp = withdrawals[withdrawals["Form 990 Expense Line"].str.strip() == ""].copy()
+        if not missing_exp.empty:
+            lines.append("⚠️  ACTION REQUIRED: MISSING EXPENSE LINE TAGS")
+            lines.append("-" * 50)
+            lines.append(f"  Count: {len(missing_exp)} transactions")
+            lines.append(f"  Total: {format_currency(missing_exp['AbsAmount'].sum())}")
+            show = missing_exp.sort_values(["Month", "Date"]).head(25)
+            for _, me in show.iterrows():
+                lines.append(f"    {int(me['Month']):02d}/{me['Date']} | {format_currency(me['AbsAmount'])} | {me['Description'][:50]}")
+            if len(missing_exp) > 25:
+                lines.append(f"    ... and {len(missing_exp) - 25} more")
+            lines.append("")
+
+        missing_func = withdrawals[~withdrawals["__func_cat"].isin(VALID_FUNCTIONAL_CATEGORIES)].copy()
+        if not missing_func.empty:
+            lines.append("⚠️  ACTION REQUIRED: MISSING FUNCTIONAL CATEGORY")
+            lines.append("-" * 50)
+            lines.append(f"  Count: {len(missing_func)} transactions")
+            lines.append(f"  Total: {format_currency(missing_func['AbsAmount'].sum())}")
+            lines.append("  (Must assign Program, M&G, or Fundraising)")
+            show = missing_func.sort_values(["Month", "Date"]).head(25)
+            for _, mf in show.iterrows():
+                lines.append(f"    {int(mf['Month']):02d}/{mf['Date']} | {format_currency(mf['AbsAmount'])} | {mf['Description'][:50]}")
+            if len(missing_func) > 25:
+                lines.append(f"    ... and {len(missing_func) - 25} more")
+            lines.append("")
+
+    # =========================================================================
+    # DATA INTEGRITY CHECK
+    # =========================================================================
+    lines.append("=" * 80)
+    lines.append("DATA INTEGRITY CHECK")
+    lines.append("=" * 80)
+    
+    # Check that functional allocations sum correctly
+    if not withdrawals.empty:
+        func_sum = prog_total + mg_total + fund_total + unallocated
+        if abs(func_sum - total_expenses) < 0.01:
+            lines.append("✅ Functional allocations balance correctly")
+        else:
+            lines.append(f"⚠️  Functional allocations don't balance: {format_currency(func_sum)} vs {format_currency(total_expenses)}")
+    
+    # Check for missing tags
+    missing_count = 0
+    if not deposits.empty:
+        missing_count += len(deposits[deposits["Form 990 Revenue Line"].str.strip() == ""])
+    if not withdrawals.empty:
+        missing_count += len(withdrawals[withdrawals["Form 990 Expense Line"].str.strip() == ""])
+        missing_count += len(withdrawals[~withdrawals["__func_cat"].isin(VALID_FUNCTIONAL_CATEGORIES)])
+    
+    if missing_count == 0:
+        lines.append("✅ All transactions have required Form 990 tags")
+    else:
+        lines.append(f"⚠️  {missing_count} transactions need tag corrections (see above)")
+
+    lines.append("")
+    lines.append("=" * 80)
+    lines.append("End of Form 990 Worksheet Report")
+    lines.append("=" * 80)
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# UI: Upload
+# UI: Upload files
 # ---------------------------------------------------------------------------
 
-st.header("Step 1 – Upload Monthly Files (CSV or Excel)")
+st.header("Step 1 — Upload Monthly Files")
 
 uploaded_files = st.file_uploader(
-    "Upload 1–12 monthly exports from the FAOA Monthly Treasurer Tool:",
+    "Upload 1–12 monthly exports (CSV or Excel). You may upload in any order.",
     type=["csv", "xlsx", "xls"],
     accept_multiple_files=True,
 )
 
 if not uploaded_files:
-    st.info("Please upload at least one file.")
+    st.info("Upload at least one file to continue.")
     st.stop()
 
 if len(uploaded_files) > 12:
     st.error("You may upload at most 12 monthly files.")
     st.stop()
 
-dfs = []
+# Read + validate each file
+dfs: List[pd.DataFrame] = []
+file_months: Dict[str, Tuple[int, int]] = {}  # filename -> (year, month) best-effort
+
 for f in uploaded_files:
-    df = read_uploaded_file(f)
-    df = ensure_columns(df)
+    df = read_upload(f)
+    validate_schema(df, f.name)
+    df = normalize_types(df)
     dfs.append(df)
 
-full_df = pd.concat(dfs, ignore_index=True)
+    # best-effort: detect the file's month/year
+    try:
+        yy = int(df["Year"].dropna().unique()[0])
+        mm = int(df["Month"].dropna().unique()[0])
+        file_months[f.name] = (yy, mm)
+    except Exception:
+        pass
 
-year = validate_year(full_df)
-validate_categories(full_df)
+merged = pd.concat(dfs, ignore_index=True)
 
-# Enforce / normalize professional fees rules BEFORE summaries and reports
-full_df = enforce_professional_fees_rules(full_df)
+year = validate_single_year(merged)
 
-st.success(f"Loaded {len(uploaded_files)} file(s) for year {year}.")
+# Deduplicate transactions
+merged, removed = dedupe_transactions(merged)
 
-# ---------------------------------------------------------------------------
-# UI: Gala Ticket Reclassification (2 -> 9)
-# ---------------------------------------------------------------------------
+months_present, months_missing = month_coverage(merged)
 
-st.header("Step 2 – Gala Ticket Reclassification (Category 2 → Category 9)")
-
-cat2_raw_total = float(full_df.loc[full_df["IRS Category Code"] == "2", "Amount"].sum())
-
-st.write(
-    "If Stripe combined **Gala Ticket revenue** into **Category 2 - Membership fees received**, enter the Gala Ticket amount below.\n"
-    "This amount will be **subtracted from Category 2** and **added to Category 9** (Adjusted totals only), and will appear as an itemized line under Category 9."
+st.success(
+    f"Loaded {len(uploaded_files)} file(s) for year {year}. "
+    f"De-dup removed {removed} duplicate row(s)."
 )
-
-gala_ticket_amount = st.number_input(
-    "Gala ticket amount to reclassify (USD)",
-    min_value=0.0,
-    value=float(st.session_state.get("gala_ticket_amount", 0.0)),
-    step=10.0,
-    format="%.2f",
-    help=f"Raw total currently in Category 2 is {format_currency(cat2_raw_total)}.",
-)
-st.session_state["gala_ticket_amount"] = float(gala_ticket_amount)
-
 st.caption(
-    f"Category 2 raw total: {format_currency(cat2_raw_total)} • "
-    f"Reclass amount: {format_currency(gala_ticket_amount)} • "
-    f"Net Category 2 after reclass (Adjusted only): {format_currency(cat2_raw_total - gala_ticket_amount)}"
+    f"Months present: {', '.join(map(str, months_present))}"
+    + (f" | Missing: {', '.join(map(str, months_missing))}" if months_missing else " | All 12 months present")
 )
 
 # ---------------------------------------------------------------------------
-# UI: Annual Summary (Adjusted totals editable)
+# Data quality summary
 # ---------------------------------------------------------------------------
 
-st.header("Step 3 – Annual Summary by IRS Category (Editable Adjusted Totals)")
+with st.expander("Data Quality Summary"):
+    st.subheader("Transaction Statistics")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Total Transactions", len(merged))
+    with col2:
+        st.metric("Total Revenue", format_currency(merged[merged["Amount"] > 0]["Amount"].sum()))
+    with col3:
+        st.metric("Total Expenses", format_currency(merged[merged["Amount"] < 0]["Amount"].abs().sum()))
 
-summary_df = build_summary_table(full_df)
-summary_df = apply_gala_ticket_reclass(summary_df, float(st.session_state.get("gala_ticket_amount", 0.0)))
+    st.subheader("Tagging Completeness")
 
-st.write(
-    "Review the annual totals below. You may edit **Adjusted Total Amount** to apply year-end corrections.\n\n"
-    "Note: Gala Ticket reclassification has already been applied to the **Adjusted** totals for Category 2 and Category 9."
-)
+    # Check for missing tags
+    missing_1023 = merged[merged["IRS Category Code (1023)"].str.strip() == ""]
+    missing_990_rev = merged[(merged["Amount"] > 0) & (merged["Form 990 Revenue Line"].str.strip() == "")]
+    missing_990_exp = merged[(merged["Amount"] < 0) & (merged["Form 990 Expense Line"].str.strip() == "")]
+    missing_990_func = merged[(merged["Amount"] < 0) & (~merged["Form 990 Functional Category"].str.strip().isin(VALID_FUNCTIONAL_CATEGORIES))]
+    flagged = merged[merged["Needs Further Investigation"] == True]
 
-edited_summary_df = st.data_editor(
-    summary_df,
-    num_rows="fixed",
-    disabled=["IRS Category Code", "IRS Category Label", "Raw Total Amount"],
-    key="annual_summary_editor",
-)
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if len(missing_1023) > 0:
+            st.warning(f"⚠️ {len(missing_1023)} transactions missing 1023 category")
+        else:
+            st.success("✅ All transactions have 1023 category")
+
+    with col2:
+        missing_990_count = len(missing_990_rev) + len(missing_990_exp)
+        if missing_990_count > 0:
+            st.warning(f"⚠️ {missing_990_count} transactions missing 990 line tags")
+        else:
+            st.success("✅ All transactions have 990 line tags")
+
+    with col3:
+        if len(missing_990_func) > 0:
+            st.warning(f"⚠️ {len(missing_990_func)} expenses missing functional category")
+        else:
+            st.success("✅ All expenses have functional category")
+
+    if len(flagged) > 0:
+        st.info(f"ℹ️ {len(flagged)} transactions flagged for further investigation")
 
 # ---------------------------------------------------------------------------
-# UI: Generate Reports
+# Optional: Preview merged data
 # ---------------------------------------------------------------------------
 
-st.header("Step 4 – Generate Text Reports")
-
-if "report_a_text" not in st.session_state:
-    st.session_state["report_a_text"] = ""
-if "report_b_text" not in st.session_state:
-    st.session_state["report_b_text"] = ""
-
-if st.button("Generate Both Reports"):
-    st.session_state["report_a_text"] = build_report_a_annual_irs(
-        year=year,
-        summary_df=edited_summary_df,
-        full_df=full_df,
-        gala_ticket_amount=float(st.session_state.get("gala_ticket_amount", 0.0)),
-    )
-    st.session_state["report_b_text"] = build_report_b_form_990(
-        year=year,
-        full_df=full_df,
-    )
+with st.expander("Preview merged annual data (first 200 rows)"):
+    st.dataframe(merged.head(200), use_container_width=True)
 
 # ---------------------------------------------------------------------------
-# UI: Preview + Downloads
+# Generate reports
 # ---------------------------------------------------------------------------
 
-if st.session_state["report_a_text"] or st.session_state["report_b_text"]:
-    st.subheader("Preview – Report A (IRS/1023-style Annual Report)")
-    st.text_area(
-        "Report A (preview)",
-        value=st.session_state["report_a_text"],
-        height=450,
-    )
+st.header("Step 2 — Generate Annual Text Reports")
 
-    st.subheader("Preview – Report B (Form 990 Expense Rollup)")
-    st.text_area(
-        "Report B (preview)",
-        value=st.session_state["report_b_text"],
-        height=450,
-    )
+if "report_1023" not in st.session_state:
+    st.session_state["report_1023"] = ""
+if "report_990" not in st.session_state:
+    st.session_state["report_990"] = ""
 
-    st.header("Step 5 – Download Outputs")
+colA, colB = st.columns(2)
+
+with colA:
+    if st.button("Generate 1023 / 990-EZ Annual Text Report"):
+        st.session_state["report_1023"] = build_report_1023(year, merged)
+
+with colB:
+    if st.button("Generate Form 990 Smart Annual Text Report"):
+        st.session_state["report_990"] = build_report_990(year, merged)
+
+# Convenience button
+if st.button("Generate BOTH Reports"):
+    st.session_state["report_1023"] = build_report_1023(year, merged)
+    st.session_state["report_990"] = build_report_990(year, merged)
+
+# ---------------------------------------------------------------------------
+# Preview + downloads
+# ---------------------------------------------------------------------------
+
+st.header("Step 3 — Preview + Download Outputs")
+
+if st.session_state["report_1023"]:
+    st.subheader("Preview: Output 1 — 1023 / 990-EZ Style Annual Report")
+    st.text_area("Output 1 Preview", st.session_state["report_1023"], height=450)
 
     st.download_button(
-        "Download Report A (.txt)",
-        data=st.session_state["report_a_text"],
-        file_name=f"FAOA_Annual_Financial_Report_{year}_ReportA_IRS.txt",
+        "Download Output 1 (.txt)",
+        data=st.session_state["report_1023"],
+        file_name=f"FAOA_Annual_Report_{year}_1023_990EZ.txt",
         mime="text/plain",
     )
 
+if st.session_state["report_990"]:
+    st.subheader("Preview: Output 2 — Form 990 Smart Annual Report")
+    st.text_area("Output 2 Preview", st.session_state["report_990"], height=450)
+
     st.download_button(
-        "Download Report B (.txt)",
-        data=st.session_state["report_b_text"],
-        file_name=f"FAOA_Annual_Financial_Report_{year}_ReportB_Form990.txt",
+        "Download Output 2 (.txt)",
+        data=st.session_state["report_990"],
+        file_name=f"FAOA_Annual_Report_{year}_Form990_Smart.txt",
         mime="text/plain",
     )
 
-    adjusted_summary_csv = edited_summary_df.to_csv(index=False)
-    st.download_button(
-        "Download Adjusted Annual Summary (.csv)",
-        data=adjusted_summary_csv,
-        file_name=f"FAOA_Annual_Summary_{year}_Adjusted.csv",
-        mime="text/csv",
-    )
+# Optional merged CSV download
+merged_csv = merged.to_csv(index=False)
+st.download_button(
+    "Download Merged Annual CSV (optional)",
+    data=merged_csv,
+    file_name=f"FAOA_Merged_Annual_{year}.csv",
+    mime="text/csv",
+)
